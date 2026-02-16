@@ -50,6 +50,7 @@ function decrypt(text: string): string {
 // In-memory storage for signals to reduce SQLite load
 let memorySignals: Signal[] = [];
 const MAX_MEMORY_SIGNALS = 100;
+let signalIdCounter = Date.now();
 
 export interface IStorage {
   getUser(id: string): Promise<User | undefined>;
@@ -59,6 +60,7 @@ export interface IStorage {
   upsertUserLane(lane: InsertUserLane): Promise<UserLane>;
   getGroupBinding(groupId: string, topicId?: string): Promise<GroupBinding | undefined>;
   getGroupBindings(groupId: string): Promise<GroupBinding[]>;
+  getAllGroupBindings(): Promise<GroupBinding[]>;
   upsertGroupBinding(binding: InsertGroupBinding): Promise<GroupBinding>;
   getUserSubscriptions(userId: string): Promise<UserSubscription[]>;
   getUserPremium(userId: string): Promise<any | undefined>;
@@ -253,6 +255,10 @@ export class DatabaseStorage implements IStorage {
     return created as GroupBinding;
   }
 
+  async getAllGroupBindings(): Promise<GroupBinding[]> {
+    return db.select().from(groupBindings) as any;
+  }
+
   async getWallets(userId: string): Promise<Wallet[]> {
     const results = await db.select().from(wallets).where(eq(wallets.userId, userId)).orderBy(desc(wallets.isActive), desc(wallets.createdAt));
     return results.map((w: any) => ({ ...w, privateKey: decrypt(w.privateKey) })) as any;
@@ -311,7 +317,7 @@ export class DatabaseStorage implements IStorage {
   async createSignal(insertSignal: InsertSignal): Promise<Signal> {
     const newSignal: Signal = {
       ...insertSignal,
-      id: Date.now(),
+      id: ++signalIdCounter,
       createdAt: Date.now(),
       lastUpdateAt: Date.now(),
       data: typeof insertSignal.data === 'string' ? insertSignal.data : JSON.stringify(insertSignal.data || {})
@@ -324,7 +330,12 @@ export class DatabaseStorage implements IStorage {
   async updateSignal(id: number, data: Partial<Signal>): Promise<void> {
     const idx = memorySignals.findIndex(s => s.id === id);
     if (idx !== -1) {
-      memorySignals[idx] = { ...memorySignals[idx], ...data, lastUpdateAt: Date.now() } as any;
+      // Ensure lastUpdateAt is always a number
+      const updateData = { 
+        ...data, 
+        lastUpdateAt: typeof data.lastUpdateAt === 'number' ? data.lastUpdateAt : Date.now() 
+      };
+      memorySignals[idx] = { ...memorySignals[idx], ...updateData } as any;
     }
   }
 

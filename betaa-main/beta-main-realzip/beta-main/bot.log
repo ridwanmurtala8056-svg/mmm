@@ -1,0 +1,23 @@
+nohup: ignoring input
+
+> rest-express@1.0.0 dev
+> tsx server/index.ts
+
+
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+Error [TransformError]: Transform failed with 1 error:
+/workspaces/mmm/betaa-main/beta-main-realzip/beta-main/server/signals-worker.ts:829:8: ERROR: Cannot use "continue" here:
+    at failureErrorWithLog (/workspaces/mmm/betaa-main/beta-main-realzip/beta-main/node_modules/@esbuild-kit/esm-loader/node_modules/esbuild/lib/main.js:1467:15)
+    at /workspaces/mmm/betaa-main/beta-main-realzip/beta-main/node_modules/@esbuild-kit/esm-loader/node_modules/esbuild/lib/main.js:736:50
+    at responseCallbacks.<computed> (/workspaces/mmm/betaa-main/beta-main-realzip/beta-main/node_modules/@esbuild-kit/esm-loader/node_modules/esbuild/lib/main.js:603:9)
+    at handleIncomingPacket (/workspaces/mmm/betaa-main/beta-main-realzip/beta-main/node_modules/@esbuild-kit/esm-loader/node_modules/esbuild/lib/main.js:658:12)
+    at Socket.readFromStdout (/workspaces/mmm/betaa-main/beta-main-realzip/beta-main/node_modules/@esbuild-kit/esm-loader/node_modules/esbuild/lib/main.js:581:7)
+    at Socket.emit (node:events:508:28)
+    at addChunk (node:internal/streams/readable:559:12)
+    at readableAddChunkPushByteMode (node:internal/streams/readable:510:3)
+    at Readable.push (node:internal/streams/readable:390:5)
+    at Pipe.onStreamRead (node:internal/stream_base_commons:189:23)
+
+Node.js v24.11.1

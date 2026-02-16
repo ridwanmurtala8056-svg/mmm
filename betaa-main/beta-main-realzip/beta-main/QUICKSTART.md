@@ -78,10 +78,13 @@ Once started, the bot will:
 Send these to your bot on Telegram:
 
 ```
-/start           → Shows main menu
-/help            → Shows command guide
-/bind crypto     → Bind to crypto signals
-/ai Hello        → Test AI integration
+/help                              → Shows full command guide
+/start                             → Shows welcome message
+/ai What's Bitcoin's trend?        → Ask AI specialist
+/check DOGE                        → Check token by name
+/check EPjFWaLb3bSsKUje29MC7pNq... → Check Solana meme coin by mint address
+/check SHIB https://shibatoken.com → Check with website
+/bind crypto                       → Bind to crypto signals
 ```
 
 ---
@@ -96,6 +99,7 @@ Send these to your bot on Telegram:
 | `/bind [market]` | Bind group to signals (crypto/forex/ai) |
 | `/unbind [market]` | Unbind from signals |
 | `/ai [query]` | Ask AI specialist |
+| `/check [token] [website]` | Verify meme coin authenticity (Twitter, website, holders) |
 | `/analyze [pair]` | Deep institutional analysis |
 | `/setup [pair]` | Find neutral setup |
 | `/settings` | Configure preferences |

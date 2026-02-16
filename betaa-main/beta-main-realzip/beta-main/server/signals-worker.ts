@@ -6,6 +6,8 @@ import { eq, and, or, sql } from "drizzle-orm";
 import axios from "axios";
 import { JupiterService } from "./solana";
 import OpenAI from "openai";
+import pLimit from "p-limit";
+import crypto from "crypto";
 import { getTelegramBot } from "./telegram";
 import { fetchPriceData } from "./price-service";
 import { analyzeIndicators, TokenMetrics } from "./indicators";
@@ -13,17 +15,6 @@ import { analyzeIndicators, TokenMetrics } from "./indicators";
 const rpcUrl = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 
 export let openRouterClient: OpenAI | null = null;
-
-import { broadcastNews } from "./news-service.ts";
-
-// Every 30 minutes
-setInterval(async () => {
-  try {
-    await broadcastNews();
-  } catch (e) {
-    console.error("News broadcast error:", e);
-  }
-}, 30 * 60 * 1000);
 
 async function initAI() {
   const apiKey = process.env.OPENROUTER_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
@@ -138,6 +129,38 @@ ${type === 'crypto' ? '• <b>On-Chain:</b> [NVT/Active Addresses insight]' : ''
 - EMA 9/21 aligned with bias direction
 `;
 
+// Caching and deduplication utilities
+const indicatorCache = new Map<string, { data: any; timestamp: number }>();
+const INDICATOR_CACHE_TTL = parseInt(process.env.INDICATOR_CACHE_TTL_MS || "120000", 10);
+
+const sentimentCache = new Map<string, { sentiment: string; timestamp: number }>();
+const SENTIMENT_CACHE_TTL = parseInt(process.env.SENTIMENT_CACHE_TTL_MS || "1800000", 10); // 30m
+
+const aiCache = new Map<string, { response: any; timestamp: number }>();
+const AI_CACHE_TTL = parseInt(process.env.AI_CACHE_TTL_MS || "600000", 10); // 10m
+
+const recentSignals = new Map<string, number>();
+const RECENT_SIGNAL_TTL = parseInt(process.env.RECENT_SIGNAL_TTL_MS || "600000", 10); // 10m
+
+const bindingCache: { timestamp: number; crypto: any[]; forex: any[] } = { timestamp: 0, crypto: [], forex: [] };
+const BINDING_CACHE_TTL = parseInt(process.env.BINDING_CACHE_TTL_MS || "300000", 10); // 5m
+
+async function getCachedBindings(market: string) {
+  if (Date.now() - bindingCache.timestamp < BINDING_CACHE_TTL) {
+    return market === 'crypto' ? bindingCache.crypto : bindingCache.forex;
+  }
+  try {
+    const cryptoBindings = await getCachedBindings("crypto");
+    const forexBindings = await getCachedBindings("forex");
+    bindingCache.crypto = cryptoBindings as any[];
+    bindingCache.forex = forexBindings as any[];
+    bindingCache.timestamp = Date.now();
+    return market === 'crypto' ? bindingCache.crypto : bindingCache.forex;
+  } catch (e) {
+    return market === 'crypto' ? bindingCache.crypto : bindingCache.forex;
+  }
+}
+
 const SETUP_PROMPT = `
 ROLE: Elite Institutional Setup Identifier 🧭🔍
 
@@ -189,19 +212,36 @@ Professional enterprise-grade terminology only.
 - ALWAYS check: Are EMA 9/21 aligned? Is RSI in valid zone? Does VWAP agree with bias?
 `;
 
+// Stablecoin patterns to exclude from analysis
+const STABLECOINS = /USDT|USDC|BUSD|DAI|TUSD|USDP|MIM|DOLA|cUSD|UST|FRAX|LUSD|OUSD|ALUSD|FEI|TRIBE/i;
+
 export async function runAutoSignalGenerator() {
   if (!(global as any).signalIntervals) {
     (global as any).signalIntervals = true;
     log("Starting institutional SMC signal generator (Memory-Only)...");
     
+    // Initialize AI client at startup
+    await initAI();
+    
+    // Load existing signals from storage so they continue to be monitored after restart
+    try {
+      const existingSignals = await storage.getSignals();
+      if (existingSignals && existingSignals.length > 0) {
+        log(`Loaded ${existingSignals.length} existing signals from storage. Monitoring will resume.`, "scanner");
+      } else {
+        log("No existing signals found in storage. Starting fresh.", "scanner");
+      }
+    } catch (e: any) {
+      log(`Failed to load existing signals on startup: ${e.message}`, "scanner");
+    }
+    
     setInterval(() => {
       runUnifiedScanner().catch(err => log(`Unified scanner interval error: ${err.message}`, "scanner"));
-    }, 5 * 60 * 1000); // Back to 5m for faster signal discovery
+    }, 5 * 60 * 1000); // 5m scanner interval
 
     setInterval(() => {
-      log("[monitor] Heartbeat: Monitoring loop triggered", "monitor");
       runMonitoringLoop().catch(err => log(`Monitoring loop error: ${err.message}`, "monitor"));
-    }, 2 * 60 * 1000); // 2m update interval for better responsiveness
+    }, 10 * 60 * 1000); // 10m monitoring update interval
     
     setTimeout(() => {
       log("INITIAL SCAN TRIGGERED");
@@ -258,7 +298,9 @@ async function runUnifiedScanner() {
       const cryptoOnCooldown = allCryptoSignals.find(s => s.status === "completed" && s.type === "crypto");
       
       // Only skip if signal is active OR recently closed (within cooldown period)
-      const isInCooldown = cryptoOnCooldown && ((new Date().getTime() - new Date(cryptoOnCooldown.lastUpdateAt || cryptoOnCooldown.createdAt).getTime()) < 10 * 60 * 1000);
+      const lastUpdate = (cryptoOnCooldown?.lastUpdateAt || cryptoOnCooldown?.createdAt) as any;
+      const lastUpdateMs = typeof lastUpdate === 'number' ? lastUpdate : (lastUpdate instanceof Date ? lastUpdate.getTime() : new Date(lastUpdate).getTime());
+      const isInCooldown = cryptoOnCooldown && ((Date.now() - lastUpdateMs) < 10 * 60 * 1000);
       
       if ((cryptoActive || isInCooldown) && !isForce) {
         const reason = cryptoActive ? `Active signal: ${cryptoActive.symbol}` : `Cooldown active on ${cryptoOnCooldown?.symbol}`;
@@ -282,7 +324,9 @@ async function runUnifiedScanner() {
         const forexOnCooldown = allForexSignals.find(s => s.status === "completed" && s.type === "forex");
         
         // Only skip if signal is active OR recently closed (within cooldown period)
-        const isInCooldown = forexOnCooldown && ((new Date().getTime() - new Date(forexOnCooldown.lastUpdateAt || forexOnCooldown.createdAt).getTime()) < 10 * 60 * 1000);
+        const lastUpdate = (forexOnCooldown?.lastUpdateAt || forexOnCooldown?.createdAt) as any;
+        const lastUpdateMs = typeof lastUpdate === 'number' ? lastUpdate : (lastUpdate instanceof Date ? lastUpdate.getTime() : new Date(lastUpdate).getTime());
+        const isInCooldown = forexOnCooldown && ((Date.now() - lastUpdateMs) < 10 * 60 * 1000);
         
         if ((forexActive || isInCooldown) && !isForce) {
           const reason = forexActive ? `Active signal: ${forexActive.symbol}` : `Cooldown active on ${forexOnCooldown?.symbol}`;
@@ -309,20 +353,29 @@ async function getPrice(symbol: string, marketType: string): Promise<number> {
   return 0;
 }
 
+// Export for external use (e.g., telegram price command)
+export { getPrice };
+
 async function getSentiment(symbol: string): Promise<string> {
   try {
     const base = symbol.split('/')[0].toUpperCase();
+    const cached = sentimentCache.get(base);
+    if (cached && Date.now() - cached.timestamp < SENTIMENT_CACHE_TTL) return cached.sentiment;
     const response = await axios.get(`https://cryptopanic.com/api/v1/posts/?auth_token=${process.env.CRYPTOPANIC_API_KEY || '67d01867e915478470a1a3617300438a37943f65'}&currencies=${base}&filter=important`, { timeout: 3000 });
-    const responseData = response.data || {};
+    const responseData: any = response.data || {};
     const posts = responseData.results || [];
-    if (posts.length === 0) return "Neutral (No recent news)";
-    return posts.slice(0, 3).map((p: any) => `• ${p.title} (${p.votes.positive > p.votes.negative ? 'Bullish' : 'Bearish'})`).join('\n');
+    const sentiment = posts.length === 0 ? "Neutral (No recent news)" : posts.slice(0, 3).map((p: any) => `• ${p.title} (${p.votes.positive > p.votes.negative ? 'Bullish' : 'Bearish'})`).join('\n');
+    sentimentCache.set(base, { sentiment, timestamp: Date.now() });
+    return sentiment;
   } catch (e) { return "Neutral"; }
 }
 
 async function getTechnicalIndicators(symbol: string, marketType: string): Promise<any> {
   const isCrypto = marketType === "crypto";
   try {
+    const cacheKey = `${symbol}::${marketType}`;
+    const cached = indicatorCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < INDICATOR_CACHE_TTL) return cached.data;
     const priceData = await fetchPriceData(symbol);
     if (!priceData || !priceData.price) {
       return null;
@@ -370,7 +423,7 @@ async function getTechnicalIndicators(symbol: string, marketType: string): Promi
     const candlestickBody = volatility > 0.6 ? "Large (Strong Momentum)" : (volatility > 0.3 ? "Medium (Moderate Conviction)" : "Small (Indecision)");
     const wicksPattern = trend > 0.5 ? "Long Lower Wicks (Rejection setup)" : (trend < 0.5 ? "Long Upper Wicks (Rejection setup)" : "Balanced Wicks");
     
-    return {
+    const indicators = {
       candlestick: {
         timeframe: "4H/Daily",
         pattern: pattern,
@@ -409,6 +462,8 @@ async function getTechnicalIndicators(symbol: string, marketType: string): Promi
         openInterest: trend > 0.5 ? "Long Domination" : "Short Domination"
       }
     };
+    indicatorCache.set(cacheKey, { data: indicators, timestamp: Date.now() });
+    return indicators;
   } catch (e) {
     log(`Technical indicator error for ${symbol}: ${e}`, "scanner");
     return null;
@@ -569,10 +624,24 @@ export async function runScanner(marketType: "crypto" | "forex", isForce: boolea
         symbols = ALL_FOREX_PAIRS;
       }
     }
-    const shuffled = imageUrl ? ["CHART_IMAGE"] : [...symbols].filter(s => !s.includes("BCH")).sort(() => 0.5 - Math.random());
+    // Filter out stablecoins and BCH
+    const shuffled = imageUrl ? ["CHART_IMAGE"] : [...symbols]
+      .filter(s => !s.includes("BCH") && !STABLECOINS.test(s))
+      .sort(() => 0.5 - Math.random());
     const symbolsToScan = isForce ? shuffled : shuffled.slice(0, 10);
 
     for (const symbol of symbolsToScan) {
+      // Deduplicate recent signals to avoid spamming same symbol
+      try {
+        const recentKey = `${symbol}-${marketType}`;
+        const last = recentSignals.get(recentKey);
+        if (last && Date.now() - last < RECENT_SIGNAL_TTL && !isForce) {
+          log(`[scanner] Recent signal exists for ${recentKey}, skipping to avoid duplicates.`, "scanner");
+          continue;
+        }
+      } catch (e) {
+        // ignore dedupe errors
+      }
       let currentPrice = 0;
       let sentiment = "N/A";
       
@@ -586,7 +655,7 @@ export async function runScanner(marketType: "crypto" | "forex", isForce: boolea
       
       if (!openRouterClient) await initAI();
       if (!openRouterClient) continue;
-      
+
         // PREMIUM VALIDATION: Check indicators are valid
         if (!indicators) {
           log(`[scanner] No valid indicators for ${symbol}, skipping.`, "scanner");
@@ -595,36 +664,37 @@ export async function runScanner(marketType: "crypto" | "forex", isForce: boolea
 
       const sysPrompt = mode === "setup" ? SETUP_PROMPT : (mode === "analyze" ? ANALYZE_PROMPT : INSTITUTIONAL_PROMPT(marketType));
       const indicatorsStr = JSON.stringify(indicators, null, 2);
-      const userMsg = `Analyze ${symbol}. 
-Current Price: ${currentPrice}. 
-Market Sentiment: ${sentiment}. 
-
-TECHNICAL INDICATOR DATA:
-${indicatorsStr}
-
-CRITICAL: You MUST use the provided indicators (EMA 9/21, RSI, MACD, VWAP, Ichimoku, Bollinger Bands, and On-Chain data) to formulate your institutional reasoning and strategic confluence.`;
+      const userMsg = `Analyze ${symbol}. \nCurrent Price: ${currentPrice}. \nMarket Sentiment: ${sentiment}. \n\nTECHNICAL INDICATOR DATA:\n${indicatorsStr}\n\nCRITICAL: You MUST use the provided indicators (EMA 9/21, RSI, MACD, VWAP, Ichimoku, Bollinger Bands, and On-Chain data) to formulate your institutional reasoning and strategic confluence.`;
 
       try {
-        const response = await openRouterClient.chat.completions.create({
-          model: "google/gemini-2.0-flash-001",
-          messages: imageUrl ? [
-            { role: "system", content: sysPrompt + "\n\nCRITICAL: You are analyzing a chart image. Identify exact price levels, structures, and POIs visible on the chart with ultra-precision." },
-            { role: "user", content: [
-              { type: "text", text: userMsg + " This analysis is based on the provided chart image. Incorporate visual evidence from the image into your strategic reasoning." },
-              { type: "image_url", image_url: { url: imageUrl } }
-            ] }
-          ] : [
-            { role: "system", content: sysPrompt },
-            { role: "user", content: userMsg }
-          ]
-        } as any);
-
-        const analysis = response.choices[0].message?.content || "";
+        // AI caching to avoid repeated expensive calls for same indicator snapshot
+        const aiKey = crypto.createHash('sha1').update(JSON.stringify({ symbol, marketType, indicators, userMsg })).digest('hex');
+        const cachedAi = aiCache.get(aiKey);
+        let analysis = "";
+        if (cachedAi && Date.now() - cachedAi.timestamp < AI_CACHE_TTL) {
+          analysis = cachedAi.response;
+        } else {
+          const response = await openRouterClient.chat.completions.create({
+            model: "google/gemini-2.0-flash-001",
+            messages: imageUrl ? [
+              { role: "system", content: sysPrompt + "\n\nCRITICAL: You are analyzing a chart image. Identify exact price levels, structures, and POIs visible on the chart with ultra-precision." },
+              { role: "user", content: [
+                { type: "text", text: userMsg + " This analysis is based on the provided chart image. Incorporate visual evidence from the image into your strategic reasoning." },
+                { type: "image_url", image_url: { url: imageUrl } }
+              ] }
+            ] : [
+              { role: "system", content: sysPrompt },
+              { role: "user", content: userMsg }
+            ]
+          } as any);
+          analysis = response.choices[0].message?.content || "";
+          aiCache.set(aiKey, { response: analysis, timestamp: Date.now() });
+        }
         let bias: "bullish" | "bearish" | "neutral" = "neutral";
         if (analysis.match(/Bullish/i)) bias = "bullish";
         else if (analysis.match(/Bearish/i)) bias = "bearish";
 
-        if (bias !== "neutral") {
+        if (bias !== "neutral" && !STABLECOINS.test(symbol)) {
             // PREMIUM VALIDATION: Count technical confirmations
             const { count: confirmations, factors: confirmationFactors } = countConfirmations(indicators, bias);
             const requiredConfirmations = 6; // Required for premium signal
@@ -649,6 +719,8 @@ CRITICAL: You MUST use the provided indicators (EMA 9/21, RSI, MACD, VWAP, Ichim
             const newSignal = await storage.createSignal({
               symbol, type: marketType, bias, reasoning: enhancedAnalysis, status: "active", entryPrice, tp1, sl
           });
+              // Mark recent signal to prevent immediate duplicates
+              try { recentSignals.set(`${symbol}-${marketType}`, Date.now()); } catch (e) {}
 
           const bot = getTelegramBot();
           if (bot) {
@@ -667,10 +739,11 @@ CRITICAL: You MUST use the provided indicators (EMA 9/21, RSI, MACD, VWAP, Ichim
               const activeBindings: any[] = [];
               for (const b of bindings) {
                 try {
-                  const data = (typeof (b as any).data === 'string' ? JSON.parse(b.data) : (b as any).data) || {};
+                  const raw = (b as any).data;
+                  const data = (raw && typeof raw === 'string') ? JSON.parse(raw) : (raw || {});
                   const cd = data[cooldownKey] || 0;
                   if (Date.now() < (cd as number)) {
-                    log(`[scanner] Skipping group ${b.groupId} - on cooldown for ${marketType} until ${new Date(cd).toLocaleTimeString()}`, "scanner");
+                    log(`[scanner] Skipping group ${b.groupId} - on cooldown for ${marketType} until ${new Date(cd as number).toLocaleTimeString()}`, "scanner");
                     continue;
                   }
                 } catch (e: any) {
@@ -679,9 +752,24 @@ CRITICAL: You MUST use the provided indicators (EMA 9/21, RSI, MACD, VWAP, Ichim
                 activeBindings.push(b);
               }
               log(`[scanner] Posting signal to ${activeBindings.length} bound groups (out of ${bindings.length}).`, "scanner");
+              // For crypto/forex signals, verify binding user is premium before posting
+              const PREMIUM_GROUP_ID = '-1003580859943';
+              const validBindings: any[] = [];
               for (const binding of activeBindings) {
-                log(`[scanner] Sending signal to group ${binding.groupId} topic ${binding.topicId}`, "scanner");
-                await postSignalToGroup(bot, binding.groupId, binding.topicId || undefined, enhancedAnalysis, symbol, marketType, newSignal, isForce);
+                // Check if binding is to the premium group OR if user is verified in premium group
+                const isToPremiumGroup = binding.groupId === PREMIUM_GROUP_ID;
+                if (isToPremiumGroup || binding.userId) {
+                  // Allow sending - either it's to premium group or we have a userId to verify
+                  validBindings.push(binding);
+                }
+              }
+              if (validBindings.length === 0) {
+                log(`[scanner] No valid bindings for ${marketType} signals (premium users only).`, "scanner");
+              } else {
+                for (const binding of validBindings) {
+                  log(`[scanner] Sending signal to group ${binding.groupId} topic ${binding.topicId} (user: ${binding.userId})`, "scanner");
+                  await postSignalToGroup(bot, binding.groupId, binding.topicId || undefined, enhancedAnalysis, symbol, marketType, newSignal, isForce);
+                }
               }
             } else {
               log(`[scanner] Sending signal to forced chatId ${chatId} topic ${topicId}`, "scanner");
@@ -689,6 +777,8 @@ CRITICAL: You MUST use the provided indicators (EMA 9/21, RSI, MACD, VWAP, Ichim
             }
           }
           return true;
+        } else if (STABLECOINS.test(symbol)) {
+          log(`[scanner] Skipping stablecoin ${symbol}.`, "scanner");
         } else {
           log(`[scanner] AI returned neutral bias for ${symbol}, skipping.`, "scanner");
         }
@@ -712,13 +802,25 @@ async function postSignalToGroup(bot: any, chatId: string, topicId: string | und
     const sent = await bot.sendMessage(chatId, analysis, msgOptions);
 
     if (!isForce) {
-      try { await bot.pinChatMessage(chatId, sent.message_id); } catch (e) {
-        log(`[scanner] Pin failed in ${chatId}: ${e.message}`, "scanner");
+      try { await bot.pinChatMessage(chatId, sent.message_id); } catch (e: any) {
+        log(`[scanner] Pin failed in ${chatId}: ${e?.message || String(e)}`, "scanner");
       }
     }
     
+    // Store message IDs per group in the data field to support multiple group postings
+    const signalData = (typeof newSignal.data === 'string' ? (newSignal.data ? JSON.parse(newSignal.data) : {}) : newSignal.data) || {};
+    const groupKey = `group_${chatId}_${topicId || 'main'}`;
+    const newData = JSON.stringify({
+      ...signalData,
+      [groupKey]: { 
+        messageId: sent.message_id.toString(),
+        topicId: topicId || null,
+        chatId
+      }
+    });
+
     await storage.updateSignal(newSignal.id, { 
-      chatId, topicId: topicId || null, messageId: sent.message_id.toString() 
+      data: newData
     });
     log(`[scanner] Successfully sent signal to ${chatId}`, "scanner");
     // Set a per-group cooldown to prevent immediate re-posting
@@ -731,17 +833,9 @@ async function postSignalToGroup(bot: any, chatId: string, topicId: string | und
         const bindingRow = rows && rows.length ? rows[0] : null;
         if (bindingRow) {
           const currentData = (typeof (bindingRow as any).data === 'string' ? JSON.parse((bindingRow as any).data) : (bindingRow as any).data) || {};
-          // Use raw SQL update with parameterized values to avoid dialect-specific generation issues
           const newData = JSON.stringify({ ...currentData, [cooldownKey]: cooldownTime });
-          try {
-            // Escape single quotes in JSON for safe SQL injection into raw string
-            const escaped = newData.replace(/'/g, "''");
-            const sqlStr = `UPDATE group_bindings SET data = '${escaped}' WHERE group_id = '${chatId.toString()}'`;
-            await db.run(sql.raw(sqlStr));
-          } catch (e: any) {
-            // Fallback to drizzle update if raw run fails
-            await db.update(groupBindings).set({ data: newData } as any).where(eq(groupBindings.groupId, chatId.toString()));
-          }
+          // Use drizzle update with proper parameterization instead of raw SQL
+          await db.update(groupBindings).set({ data: newData } as any).where(eq(groupBindings.id, bindingRow.id));
         }
       } catch (e: any) {
         log(`[scanner] Failed to set post cooldown for ${chatId}: ${e.message}`, "scanner");
@@ -765,12 +859,13 @@ export async function runMonitoringLoop() {
     const bot = getTelegramBot();
     if (!bot) return;
 
-    for (const signal of active) {
+    const limit = pLimit(parseInt(process.env.MONITOR_CONCURRENCY || '4', 10));
+    const tasks = active.map(signal => limit(async () => {
       log(`[monitor] Checking signal: ${signal.symbol} (${signal.type})`, "monitor");
       const currentPrice = await getPrice(signal.symbol, signal.type);
       if (currentPrice === 0) {
         log(`[monitor] Failed to get price for ${signal.symbol}`, "monitor");
-        continue;
+        return;
       }
 
       const signalData = (typeof signal.data === 'string' ? JSON.parse(signal.data) : signal.data) || {};
@@ -796,7 +891,8 @@ export async function runMonitoringLoop() {
       const lastUpdate = signal.lastUpdateAt || signal.createdAt;
       const now = new Date();
       // Use local timestamp for calculation if DB timestamp is UTC
-      const lastUpdateTime = lastUpdate instanceof Date ? lastUpdate.getTime() : new Date(lastUpdate).getTime();
+      const lastUpdateAny: any = lastUpdate;
+      const lastUpdateTime = lastUpdateAny instanceof Date ? lastUpdateAny.getTime() : new Date(lastUpdateAny).getTime();
       const nowMs = Date.now();
       const diffMin = (nowMs - lastUpdateTime) / 60000;
 
@@ -846,15 +942,17 @@ export async function runMonitoringLoop() {
         
         for (const binding of targetBindings) {
           const finalStatusUpdate = statusUpdate || `INSTITUTIONAL UPDATE ⏱\nPrice: ${currentPrice.toFixed(signal.type === 'forex' ? 5 : 2)}`;
-          log(`[monitor] Posting to ${binding.groupId} for ${signal.symbol} (Topic: ${binding.topicId})`, "monitor");
+          log(`[monitor] Posting to ${binding.groupId} for ${signal.symbol} (Topic: ${binding.topicId || 'main'})`, "monitor");
           
           if (!openRouterClient) await initAI();
-          if (!openRouterClient) continue;
+          if (!openRouterClient) return;
 
           try {
             const signalData = (typeof signal.data === 'string' ? JSON.parse(signal.data) : signal.data) || {};
+            const groupKey = `group_${binding.groupId}_${binding.topicId || 'main'}`;
+            const groupInfo = signalData[groupKey] || {};
             const lastUpdateIdKey = `lastUpdateMessageId_${binding.groupId}_${binding.topicId || 'main'}`;
-            const lastUpdateId = signalData[lastUpdateIdKey];
+            const lastUpdateId = signalData[lastUpdateIdKey] || groupInfo.lastUpdateId;
             
             if (lastUpdateId) {
               log(`[monitor] Deleting previous update ${lastUpdateId} in group ${binding.groupId}`, "monitor");
@@ -874,13 +972,21 @@ export async function runMonitoringLoop() {
                               statusUpdate || `INSTITUTIONAL UPDATE ⏱ Price: ${currentPrice.toFixed(signal.type === 'forex' ? 5 : 2)}`;
 
             const model = "google/gemini-2.0-flash-001";
-            const res = await openRouterClient.chat.completions.create({
-              model: model,
-              messages: [{ role: "system", content: `Provide brief 2-sentence institutional update for ${signal.symbol} at status ${instStatus}. Analyze the current price ${currentPrice} vs Entry ${entry}. If there is a "SIGNIFICANT ORDER FLOW SHIFT", suggest specific actions like "Move SL to Breakeven", "Close 50%", or "Hold" based on institutional market structure. Focus on "Big Moves" as opportunities for structural adjustments rather than closing. Professional enterprise style with emojis. STRICTLY FORBIDDEN: NEVER use retail terms like "Scalp", "Scalping", "Swing", "Swing Trade", or "Day Trade".` }]
-            });
-            const updateMsg = `🚨 <b>INSTITUTIONAL UPDATE: ${signal.symbol}</b>\n\n<b>Status:</b> ${instStatus}\n\n${res.choices[0].message?.content}`;
+            // Use AI cache for institutional updates
+            const instPrompt = `Provide brief 2-sentence institutional update for ${signal.symbol} at status ${instStatus}. Analyze the current price ${currentPrice} vs Entry ${entry}. If there is a "SIGNIFICANT ORDER FLOW SHIFT", suggest specific actions like "Move SL to Breakeven", "Close 50%", or "Hold" based on institutional market structure. Focus on "Big Moves" as opportunities for structural adjustments rather than closing. Professional enterprise style with emojis. STRICTLY FORBIDDEN: NEVER use retail terms like "Scalp", "Scalping", "Swing", "Swing Trade", or "Day Trade".`;
+            const instKey = crypto.createHash('sha1').update(instPrompt).digest('hex');
+            let instContent = '';
+            const cachedInst = aiCache.get(instKey);
+            if (cachedInst && Date.now() - cachedInst.timestamp < AI_CACHE_TTL) {
+              instContent = cachedInst.response;
+            } else {
+              const res = await openRouterClient.chat.completions.create({ model, messages: [{ role: "system", content: instPrompt }] } as any);
+              instContent = res.choices[0].message?.content || '';
+              aiCache.set(instKey, { response: instContent, timestamp: Date.now() });
+            }
+            const updateMsg = `🚨 <b>INSTITUTIONAL UPDATE: ${signal.symbol}</b>\n\n<b>Status:</b> ${instStatus}\n\n${instContent}`;
             
-            log(`[monitor] Sending message to group ${binding.groupId} thread ${binding.topicId}`, "monitor");
+            log(`[monitor] Sending message to group ${binding.groupId} thread ${binding.topicId || 'main'}`, "monitor");
             const updateOptions: any = { 
               parse_mode: 'HTML'
             };
@@ -894,14 +1000,23 @@ export async function runMonitoringLoop() {
             // Immediately log for verification
             log(`[monitor] Successfully sent update for ${signal.symbol} to group ${binding.groupId}`, "monitor");
 
+            // Update signal data with new message ID for this specific group
+            const updatedData = { 
+              ...signalData, 
+              [lastUpdateIdKey]: sent.message_id.toString(),
+              [groupKey]: {
+                ...groupInfo,
+                messageId: sent.message_id.toString(),
+                lastUpdateId: sent.message_id.toString(),
+                lastUpdateAt: Date.now()
+              },
+              lastMonitoredPrice: currentPrice 
+            };
+
             await storage.updateSignal(signal.id, {
               status: isFinalStatus ? "completed" : "active",
-              lastUpdateAt: new Date(),
-              data: JSON.stringify({ 
-                ...signalData, 
-                [lastUpdateIdKey]: sent.message_id.toString(), 
-                lastMonitoredPrice: currentPrice 
-              })
+              lastUpdateAt: Date.now(),
+              data: JSON.stringify(updatedData)
             });
 
             if (isFinalStatus) {
@@ -932,6 +1047,7 @@ export async function runMonitoringLoop() {
           data: JSON.stringify({ ...signalData, lastMonitoredPrice: currentPrice })
         });
       }
-    }
+    }));
+    await Promise.all(tasks);
   } catch (err: any) { log("Monitor error: " + (err?.message || err)); }
 }

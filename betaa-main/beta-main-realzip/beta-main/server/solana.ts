@@ -138,10 +138,11 @@ export class JupiterService {
       try {
         const url = `${endpoint}/swap`;
         console.log(`[jupiter] Generating swap TX via ${url}`);
-        const { swapTransaction } = await axios.post(url, swapParams, { 
+        const res = await axios.post(url, swapParams, { 
           timeout: 15000,
           headers: { 'Content-Type': 'application/json' }
-        }).then(res => res.data);
+        });
+        const swapTransaction = (res.data as any)?.swapTransaction;
 
         if (!swapTransaction) continue;
 

@@ -87,3 +87,29 @@ export async function extractPairFromImage(imageUrl: string): Promise<string | n
     return null;
   }
 }
+
+export async function askAI(prompt: string, imageUrl?: string): Promise<string | null> {
+  const c = initClient();
+  if (!c) return null;
+  try {
+    const model = "google/gemini-2.0-flash-001";
+    
+    const userMessage = imageUrl ? [
+      { type: "text" as const, text: prompt || "Analyze this image for trading opportunities." },
+      { type: "image_url" as const, image_url: { url: imageUrl } }
+    ] : prompt;
+    
+    const response: any = await c.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: 'You are a helpful trading assistant and chart analyzer.' },
+        { role: 'user', content: userMessage }
+      ] as any,
+      max_tokens: 800,
+    } as any);
+    const text = response?.choices?.[0]?.message?.content;
+    return text ? String(text) : null;
+  } catch (e) {
+    return null;
+  }
+}

@@ -1,6 +1,6 @@
 import { db } from "../../db";
-import { conversations, messages } from "@shared/schema";
-import { eq, desc } from "drizzle-orm";
+import { conversations, messages } from "../../../shared/schema";
+import { eq, desc, sql } from "drizzle-orm";
 
 export interface IChatStorage {
   getConversation(id: number): Promise<typeof conversations.$inferSelect | undefined>;
@@ -32,7 +32,8 @@ export const chatStorage: IChatStorage = {
   },
 
   async getMessagesByConversation(conversationId: number) {
-    return db.select().from(messages).where(eq(messages.conversationId, conversationId)).orderBy(messages.createdAt);
+    // Use raw SQL orderBy to avoid mixing PG column types with SQLite driver types
+    return db.select().from(messages).where(eq(messages.conversationId, conversationId)).orderBy(sql`created_at` as any) as any;
   },
 
   async createMessage(conversationId: number, role: string, content: string) {

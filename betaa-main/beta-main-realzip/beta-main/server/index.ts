@@ -152,7 +152,10 @@ if (!process.env.SKIP_SERVER_START) {
           log(`Database connection/restoration failed: ${e instanceof Error ? e.message : String(e)}`, "db");
         }
         if (process.env.TELEGRAM_BOT_TOKEN) {
+          log("TELEGRAM_BOT_TOKEN present in environment. Attempting to start Telegram bot...", "telegram");
           setupTelegramBot();
+        } else {
+          log("TELEGRAM_BOT_TOKEN missing from environment at startup.", "telegram");
         }
       });
 

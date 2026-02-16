@@ -21,9 +21,14 @@ export const db = drizzle(client, { schema });
 export const isBackupEnabled = false;
 
 export const pool = { 
-        query: async (text: string, params: any[]) => {
+        query: async (text: string, params: any[] = []) => {
                 try {
                         if (text.toLowerCase().startsWith('select')) {
+                                // LibSQL doesn't support raw parameterized queries the same way
+                                // For now, just execute the raw text and log a warning if params are provided
+                                if (params && params.length > 0) {
+                                        console.warn("Pool query received params but LibSQL may not support them with raw SQL:", params);
+                                }
                                 const result = await db.run(sql.raw(text));
                                 return { rows: (result as any).rows || [] };
                         }

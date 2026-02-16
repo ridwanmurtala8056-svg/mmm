@@ -3,10 +3,21 @@ import { batchProcess } from "./replit_integrations/batch/index.ts";
 import { getTelegramBot } from "./telegram";
 import { storage } from "./storage";
 
-const openrouter = new OpenAI({
-  baseURL: process.env.AI_INTEGRATIONS_OPENROUTER_BASE_URL,
-  apiKey: process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY,
-});
+let openrouter: OpenAI | null = null;
+function getOpenRouterClient(): OpenAI | null {
+  if (openrouter) return openrouter;
+  const apiKey = process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+  const baseURL = process.env.AI_INTEGRATIONS_OPENROUTER_BASE_URL || process.env.OPENROUTER_BASE_URL;
+  try {
+    openrouter = new OpenAI({ apiKey, baseURL, dangerouslyAllowBrowser: true } as any);
+    return openrouter;
+  } catch (e) {
+    console.error('Failed to initialize OpenAI client for news-service:', e);
+    openrouter = null;
+    return null;
+  }
+}
 
 async function fetchNews(type: 'crypto' | 'forex') {
   // Mock feeds for now
@@ -28,12 +39,14 @@ export async function broadcastNews() {
     const items = await fetchNews(type);
     const hashtag = type === 'crypto' ? '#cryptonews' : '#forexnews';
 
+    const client = getOpenRouterClient();
     const summaries = await batchProcess(items, async (item) => {
-      const response = await openrouter.chat.completions.create({
+      if (!client) return item; // fallback: send raw item if no AI
+      const response = await client.chat.completions.create({
         model: "meta-llama/llama-3.3-70b-instruct",
         messages: [{ role: "user", content: `Summarize this briefly: ${item}` }],
-      });
-      return response.choices[0]?.message?.content || "";
+      } as any);
+      return (response.choices && response.choices[0] && response.choices[0].message?.content) || "";
     });
 
     for (const summary of summaries) {

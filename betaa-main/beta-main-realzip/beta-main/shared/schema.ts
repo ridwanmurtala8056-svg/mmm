@@ -6,6 +6,7 @@ export * from "./models/chat.ts";
 // === SETTINGS / TOPICS ===
 export const groupBindings = sqliteTable("group_bindings", {
   id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: text("user_id"), // Track who created this binding
   groupId: text("group_id").notNull(),
   topicId: text("topic_id"),
   lane: text("lane").notNull(), // high | med | low | cto

@@ -4,6 +4,7 @@
  */
 
 import { log } from "./index";
+import axios from "axios";
 
 export interface SocialVerification {
   hasTwitter: boolean;
@@ -76,9 +77,23 @@ export async function verifyTwitter(tokenName: string, projectName?: string): Pr
       }
     }
 
-    // Heuristic: New tokens (meme coins) tend to be higher risk
-    result.maliciousFlags.push("No verified Twitter account found");
-    result.riskScore += 20;
+    // If no Twitter found, add flag
+    if (!result.hasTwitter) {
+      result.maliciousFlags.push("⚠️ No verified Twitter/X account found (higher meme coin risk)");
+      result.riskScore += 25;
+    }
+
+    // Check token name for legitimacy length
+    if (tokenName.length < 3) {
+      result.maliciousFlags.push("⚠️ Very short token name (potential unverified token)");
+      result.riskScore += 10;
+    } else if (tokenName.length > 20) {
+      result.maliciousFlags.push("⚠️ Unusually long token name");
+      result.riskScore += 5;
+    } else {
+      result.positiveSignals.push("✅ Token name length is typical");
+      result.riskScore -= 5;
+    }
 
     // Cap risk score
     result.riskScore = Math.max(0, Math.min(100, result.riskScore));
@@ -132,26 +147,58 @@ export async function verifyProjectWebsite(websiteUrl?: string): Promise<{
   }
 
   try {
+    // Normalize URL
+    let url = websiteUrl.trim();
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      url = "https://" + url;
+    }
+
     // Check if HTTPS
-    if (websiteUrl.startsWith("https://")) {
+    if (url.startsWith("https://")) {
       result.isHttps = true;
-      result.riskAdjustment -= 10;
-    } else if (websiteUrl.startsWith("http://")) {
-      result.riskAdjustment += 10; // HTTP only = higher risk
+      result.riskAdjustment -= 15; // HTTPS is good
+    } else if (url.startsWith("http://")) {
+      result.riskAdjustment += 15; // HTTP only = higher risk
     }
 
     result.hasWebsite = true;
 
-    // In production, would check website content
-    // Checking for common indicators:
-    if (websiteUrl.includes("github") || websiteUrl.includes("docs")) {
+    // Try to verify website is accessible
+    try {
+      const response = await axios.head(url, { timeout: 5000, maxRedirects: 3 });
+      if (response.status === 200 || response.status === 301 || response.status === 302) {
+        result.riskAdjustment -= 10; // Website is accessible
+      } else {
+        result.riskAdjustment += 10; // Website returned non-200 status
+      }
+    } catch (fetchErr) {
+      result.riskAdjustment += 20; // Website not accessible
+      log(`Website not accessible: ${url}`, "social");
+    }
+
+    // Check for common legitimate indicators
+    if (url.includes("github.com") || url.includes("docs.") || url.includes("/docs") || url.includes("whitepaper")) {
       result.hasWhitepaper = true;
+      result.riskAdjustment -= 15;
+    }
+
+    if (url.includes("team") || url.includes("about") || url.includes("/about")) {
+      result.hasTeamInfo = true;
       result.riskAdjustment -= 10;
+    }
+
+    // Additional security checks
+    const suspiciousPatterns = ["free-money", "quick-rich", "guaranteed", "doubler", "pump"];
+    for (const pattern of suspiciousPatterns) {
+      if (url.toLowerCase().includes(pattern)) {
+        result.riskAdjustment += 25;
+      }
     }
 
     return result;
   } catch (e: any) {
     log(`Website verification error: ${e.message}`, "social");
+    result.riskAdjustment += 15;
     return result;
   }
 }
@@ -236,6 +283,16 @@ export function calculateSocialRiskScore(
 
   // Clamp between 0 and 100
   return Math.max(0, Math.min(100, finalScore));
+}
+
+/**
+ * Detect if string is a valid Solana address (base58, 44 chars)
+ */
+export function isSolanaAddress(input: string): boolean {
+  if (!input) return false;
+  // Solana addresses are base58 encoded and typically 44 characters
+  const base58Regex = /^[1-9A-HJ-NP-Z]{43,44}$/;
+  return base58Regex.test(input.trim());
 }
 
 /**
